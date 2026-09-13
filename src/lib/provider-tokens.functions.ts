@@ -8,12 +8,6 @@ async function assertAdmin(supabase: any, userId: string) {
   if (!data) throw new Error("Forbidden");
 }
 
-function mask(v: string, keep = 4) {
-  if (!v) return "";
-  if (v.length <= keep * 2) return "•".repeat(Math.max(4, v.length));
-  return v.slice(0, keep) + "••••" + v.slice(-keep);
-}
-
 export type ProviderTokenRow = {
   id: string;
   provider_id: string;
@@ -45,7 +39,6 @@ export const listTokens = createServerFn({ method: "POST" })
   .handler(async ({ data, context }): Promise<ProviderTokenRow[]> => {
     await assertAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { decryptSecret } = await import("./crypto.server");
     const { data: rows, error } = await supabaseAdmin
       .from("provider_tokens").select("*")
       .eq("provider_id", data.provider_id)
@@ -53,11 +46,9 @@ export const listTokens = createServerFn({ method: "POST" })
       .order("created_at", { ascending: true });
     if (error) throw new Error(error.message);
     return (rows ?? []).map((t: any) => {
-      let key = "";
-      try { key = t.api_key_enc ? decryptSecret(t.api_key_enc) : ""; } catch {}
       return {
         id: t.id, provider_id: t.provider_id, label: t.label,
-        api_key_masked: key ? mask(key, 4) : "",
+        api_key_masked: t.api_key_enc ? "Configured" : "",
         enabled: t.enabled, priority: t.priority,
         balance: Number(t.balance),
         daily_limit: t.daily_limit, monthly_limit: t.monthly_limit,
@@ -157,21 +148,9 @@ export const testToken = createServerFn({ method: "POST" })
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", ...extra },
       });
       status = res.status; ok = res.ok;
-      if (!ok) detail = (await res.text()).slice(0, 300);
-    } catch (e: any) { detail = e?.message ?? "network error"; }
+      if (!ok) detail = "Provider rejected the connectivity check";
+    } catch { detail = "Provider connection failed"; }
     const health = ok ? "healthy" : "unhealthy";
     await supabaseAdmin.from("provider_tokens").update({ health, last_health_at: new Date().toISOString() }).eq("id", data.id);
     return { ok, status, latency_ms: Date.now() - started, detail, health };
-  });
-
-export const getTokenSecret = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) => z.object({ id: z.string().uuid() }).parse(d))
-  .handler(async ({ data, context }) => {
-    await assertAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { decryptSecret } = await import("./crypto.server");
-    const { data: t, error } = await supabaseAdmin.from("provider_tokens").select("api_key_enc").eq("id", data.id).single();
-    if (error || !t) throw new Error("not found");
-    return { api_key: t.api_key_enc ? decryptSecret(t.api_key_enc) : "" };
   });

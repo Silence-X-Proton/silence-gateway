@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { Loader2, ShieldCheck } from "lucide-react";
+import { BrandLogo } from "@/components/silence/BrandLogo";
 
 export const Route = createFileRoute("/user/")({
   head: () => ({
@@ -81,9 +82,7 @@ function UserLoginPage() {
       <div aria-hidden className="pointer-events-none absolute inset-0 hero-grid opacity-30" />
       <div className="relative w-full max-w-md z-10">
         <Link to="/" className="mb-6 flex items-center justify-center gap-2.5">
-          <div className="grid h-10 w-10 place-items-center rounded-xl btn-primary text-white">
-            <span className="text-lg font-bold">S</span>
-          </div>
+            <BrandLogo className="h-10 w-10" />
           <span className="text-xl font-semibold tracking-tight text-foreground">Silence<span className="text-[color:var(--brand)]">API</span></span>
         </Link>
         <div className="rounded-2xl border border-border bg-card/80 p-7 shadow-2xl backdrop-blur-xl transition-all">

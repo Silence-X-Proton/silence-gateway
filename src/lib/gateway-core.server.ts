@@ -4,8 +4,8 @@
 export type GatewayResult =
   | { kind: "error"; status: number; body: any }
   | { kind: "upstream_error"; status: number; body: string; contentType: string }
-  | { kind: "stream"; body: ReadableStream<Uint8Array>; tokenId: string; startedAt: number; ctx: FinalizeCtx }
-  | { kind: "json"; text: string; usage: { prompt_tokens: number; completion_tokens: number }; tokenId: string; startedAt: number };
+  | { kind: "stream"; body: ReadableStream<Uint8Array>; startedAt: number; ctx: FinalizeCtx }
+  | { kind: "json"; text: string; usage: { prompt_tokens: number; completion_tokens: number }; startedAt: number };
 
 export interface FinalizeCtx {
   sb: any;
@@ -316,9 +316,9 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
       if (request.signal.aborted) {
         return { kind: "error", status: 499, body: { error: { message: "Request cancelled by client", type: "request_cancelled" } } };
       }
-      attempts.push({ token: t.id, error: e?.message ?? "network" });
+      attempts.push({ reason: "network" });
       if (t.id !== "__keyless__") await cooldownToken(supabaseAdmin, t.id, 30, "network");
-      await logError(supabaseAdmin, { provider, model, token: t, tokenKey, status: null, message: e?.message ?? "network error", response: "", latency: Date.now() - attemptStart, result: "failover" });
+      await logError(supabaseAdmin, { provider, model, token: t, status: null, message: "Provider connection failed", response: "", latency: Date.now() - attemptStart, result: "failover" });
       await Promise.allSettled([
         logUsage(supabaseAdmin, { apiKey, provider, model, token: t, cost: 0, inTok: 0, outTok: 0, latency: Date.now() - attemptStart, success: false }),
         bumpUsage(supabaseAdmin, t, 0, 0, apiKey),
@@ -328,7 +328,7 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
 
     if (res.status === 429 || res.status === 402 || res.status === 401 || res.status === 403) {
       const detail = sanitizeUpstream(await res.text());
-      attempts.push({ token: t.id, status: res.status, detail });
+      attempts.push({ status: res.status });
       let secs = res.status === 429 ? 20 : 300;
       if (res.status === 429) {
         const ra = res.headers.get("retry-after");
@@ -338,7 +338,7 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
         }
       }
       if (t.id !== "__keyless__") await cooldownToken(supabaseAdmin, t.id, secs, res.status === 429 ? "rate_limited" : "unhealthy");
-      await logError(supabaseAdmin, { provider, model, token: t, tokenKey, status: res.status, message: describeUpstream(res.status, detail), response: detail, latency: Date.now() - attemptStart, result: "failover" });
+      await logError(supabaseAdmin, { provider, model, token: t, status: res.status, message: describeUpstream(res.status, detail), response: detail, latency: Date.now() - attemptStart, result: "failover" });
       await Promise.allSettled([
         logUsage(supabaseAdmin, { apiKey, provider, model, token: t, cost: 0, inTok: 0, outTok: 0, latency: Date.now() - attemptStart, success: false }),
         bumpUsage(supabaseAdmin, t, 0, 0, apiKey),
@@ -347,9 +347,9 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
     }
     if (res.status >= 500) {
       const detail = sanitizeUpstream(await res.text());
-      attempts.push({ token: t.id, status: res.status, detail });
+      attempts.push({ status: res.status });
       if (t.id !== "__keyless__") await cooldownToken(supabaseAdmin, t.id, 15, "unhealthy");
-      await logError(supabaseAdmin, { provider, model, token: t, tokenKey, status: res.status, message: describeUpstream(res.status, detail), response: detail, latency: Date.now() - attemptStart, result: "failover" });
+      await logError(supabaseAdmin, { provider, model, token: t, status: res.status, message: describeUpstream(res.status, detail), response: detail, latency: Date.now() - attemptStart, result: "failover" });
       await Promise.allSettled([
         logUsage(supabaseAdmin, { apiKey, provider, model, token: t, cost: 0, inTok: 0, outTok: 0, latency: Date.now() - attemptStart, success: false }),
         bumpUsage(supabaseAdmin, t, 0, 0, apiKey),
@@ -367,8 +367,8 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
         // NOTE: 404 here means "this token's account has no access to THIS
         // model" — the token is still perfectly healthy for other models,
         // so we do NOT cool it down. Just skip to the next token.
-        attempts.push({ token: t.id, status: res.status, detail: detail || "empty body" });
-        await logError(supabaseAdmin, { provider, model, token: t, tokenKey, status: res.status, message: describeUpstream(res.status, detail), response: detail, latency: Date.now() - attemptStart, result: "failover" });
+        attempts.push({ status: res.status });
+        await logError(supabaseAdmin, { provider, model, token: t, status: res.status, message: describeUpstream(res.status, detail), response: detail, latency: Date.now() - attemptStart, result: "failover" });
         await Promise.allSettled([
           logUsage(supabaseAdmin, { apiKey, provider, model, token: t, cost: 0, inTok: 0, outTok: 0, latency: Date.now() - attemptStart, success: false }),
           bumpUsage(supabaseAdmin, t, 0, 0, apiKey),
@@ -376,7 +376,7 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
         continue;
       }
       await bumpUsage(supabaseAdmin, t, 0, 0, apiKey);
-      await logError(supabaseAdmin, { provider, model, token: t, tokenKey, status: res.status, message: describeUpstream(res.status, detail), response: detail, latency: Date.now() - attemptStart, result: "returned_to_client" });
+      await logError(supabaseAdmin, { provider, model, token: t, status: res.status, message: describeUpstream(res.status, detail), response: detail, latency: Date.now() - attemptStart, result: "returned_to_client" });
       await logUsage(supabaseAdmin, { apiKey, provider, model, token: t, cost: 0, inTok: 0, outTok: 0, latency: Date.now() - attemptStart, success: false });
       return { kind: "upstream_error", status: res.status, body: detail, contentType: res.headers.get("content-type") ?? "application/json" };
     }
@@ -392,7 +392,7 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
       const clientStream = createResilientUpstreamStream(res.body).pipeThrough(
         createMeterTransform({ supabaseAdmin, apiKey, provider, model, token: t, attemptStart }),
       );
-      return { kind: "stream", body: clientStream, tokenId: t.id, startedAt: attemptStart, ctx: { sb: supabaseAdmin, apiKey, provider, model, token: t, attemptStart } };
+      return { kind: "stream", body: clientStream, startedAt: attemptStart, ctx: { sb: supabaseAdmin, apiKey, provider, model, token: t, attemptStart } };
     }
 
     const rawText = await res.text();
@@ -422,10 +422,20 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
       logUsage(supabaseAdmin, { apiKey, provider, model, token: t, cost, inTok: usage.prompt_tokens, outTok: usage.completion_tokens, latency: Date.now() - attemptStart, success: true }),
       t.id !== "__keyless__" ? markUsed(supabaseAdmin, t.id) : Promise.resolve(),
     ]);
-    return { kind: "json", text, usage, tokenId: t.id, startedAt: attemptStart };
+    return { kind: "json", text, usage, startedAt: attemptStart };
   }
 
-  return { kind: "error", status: 502, body: { error: { message: "All tokens exhausted", type: "upstream_error", attempts } } };
+  return {
+    kind: "error",
+    status: 502,
+    body: {
+      error: {
+        message: "All upstream capacity is currently unavailable",
+        type: "upstream_error",
+        attempts: attempts.length,
+      },
+    },
+  };
 }
 
 // Convert an upstream TCP/body reset into a valid end-of-stream marker. Without
@@ -630,15 +640,8 @@ function describeUpstream(status: number | null, detail: string): string {
   return extra ? `${base}: ${extra}` : base;
 }
 
-// Mask a provider token so admins can identify WHICH key failed
-// without the key ever being readable.
-function fingerprint(key: string): string {
-  if (!key) return "keyless";
-  return `${key.slice(0, 4)}••••${key.slice(-4)}`;
-}
-
 async function logError(sb: any, o: {
-  provider: any; model: any; token: any; tokenKey: string;
+  provider: any; model: any; token: any;
   status: number | null; message: string; response: string;
   latency: number; result: "failover" | "returned_to_client";
 }) {
@@ -646,7 +649,7 @@ async function logError(sb: any, o: {
     await sb.from("error_events").insert({
       provider_id: o.provider?.id ?? null,
       provider_name: o.provider?.name ?? null,
-      key_fingerprint: fingerprint(o.tokenKey),
+      key_fingerprint: o.token?.id === "__keyless__" ? "keyless" : "redacted",
       token_label: o.token?.label ?? (o.token?.id === "__keyless__" ? "keyless" : null),
       model: o.model?.display_name ?? null,
       http_status: o.status,

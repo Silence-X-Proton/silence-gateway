@@ -11,7 +11,7 @@ export const Route = createFileRoute("/api/public/v1/messages")({
           if (cl > 2_000_000) return jsonResp({ type: "error", error: { type: "invalid_request_error", message: "Request body too large (max 2MB)" } }, 413);
           return await handleMessages(request);
         }
-        catch (e: any) { return jsonResp({ type: "error", error: { type: "api_error", message: e?.message ?? "internal" } }, 500); }
+        catch { return jsonResp({ type: "error", error: { type: "api_error", message: "Internal gateway error" } }, 500); }
       },
     },
   },

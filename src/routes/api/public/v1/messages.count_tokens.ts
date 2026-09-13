@@ -21,9 +21,8 @@ export const Route = createFileRoute("/api/public/v1/messages/count_tokens")({
             );
           }
           return await handleCountTokens(request);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "internal";
-          return jsonResp({ type: "error", error: { type: "api_error", message } }, 500);
+        } catch {
+          return jsonResp({ type: "error", error: { type: "api_error", message: "Internal gateway error" } }, 500);
         }
       },
     },

@@ -33,18 +33,11 @@ export type ProviderRow = {
   updated_at: string;
 };
 
-function mask(value: string, keep = 4): string {
-  if (!value) return "";
-  if (value.length <= keep * 2) return "•".repeat(Math.max(4, value.length));
-  return value.slice(0, keep) + "••••" + value.slice(-keep);
-}
-
 export const listProviders = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }): Promise<ProviderRow[]> => {
     await assertAdmin(context.supabase, context.userId);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { decryptSecret } = await import("./crypto.server");
     const { data, error } = await supabaseAdmin
       .from("providers")
       .select("*")
@@ -52,10 +45,6 @@ export const listProviders = createServerFn({ method: "GET" })
       .order("created_at", { ascending: false });
     if (error) throw new Error(error.message);
     return (data ?? []).map((p) => {
-      let baseUrl = "";
-      let apiKey = "";
-      try { baseUrl = p.base_url_enc ? decryptSecret(p.base_url_enc) : ""; } catch {}
-      try { apiKey = p.api_key_enc ? decryptSecret(p.api_key_enc) : ""; } catch {}
       return {
         id: p.id,
         name: p.name,
@@ -72,8 +61,8 @@ export const listProviders = createServerFn({ method: "GET" })
         max_input_tokens: p.max_input_tokens,
         max_output_tokens: p.max_output_tokens,
         notes: p.notes,
-        base_url_masked: baseUrl ? mask(baseUrl, 20) : "",
-        api_key_masked: apiKey ? mask(apiKey, 4) : "",
+        base_url_masked: p.base_url_enc ? "Configured" : "",
+        api_key_masked: p.api_key_enc ? "Configured" : "",
         has_headers: !!p.headers_enc,
         requires_auth: p.requires_auth !== false,
         last_health_at: p.last_health_at,
@@ -81,27 +70,6 @@ export const listProviders = createServerFn({ method: "GET" })
         updated_at: p.updated_at,
       };
     });
-  });
-
-export const getProviderSecrets = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) => z.object({ id: z.string().uuid() }).parse(d))
-  .handler(async ({ data, context }) => {
-    await assertAdmin(context.supabase, context.userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { decryptSecret } = await import("./crypto.server");
-    const { data: p, error } = await supabaseAdmin
-      .from("providers")
-      .select("base_url_enc,api_key_enc,headers_enc")
-      .eq("id", data.id)
-      .maybeSingle();
-    if (error) throw new Error(error.message);
-    if (!p) return { base_url: "", api_key: "", headers_json: "" };
-    return {
-      base_url: (() => { try { return p.base_url_enc ? decryptSecret(p.base_url_enc) : ""; } catch { return ""; } })(),
-      api_key: (() => { try { return p.api_key_enc ? decryptSecret(p.api_key_enc) : ""; } catch { return ""; } })(),
-      headers_json: (() => { try { return p.headers_enc ? decryptSecret(p.headers_enc) : ""; } catch { return ""; } })(),
-    };
   });
 
 const UpsertInput = z.object({
@@ -234,9 +202,9 @@ export const testProvider = createServerFn({ method: "POST" })
       });
       status = res.status;
       ok = res.ok;
-      if (!ok) detail = (await res.text()).slice(0, 300);
-    } catch (e: any) {
-      detail = e?.message ?? "network error";
+      if (!ok) detail = "Provider rejected the connectivity check";
+    } catch {
+      detail = "Provider connection failed";
     }
     const health = ok ? "healthy" : "unhealthy";
     await supabaseAdmin.from("providers").update({ health, last_health_at: new Date().toISOString() }).eq("id", data.id);

@@ -5,11 +5,11 @@ import { AdminGuard } from "@/components/silence/AdminGuard";
 import { AdminShell } from "@/components/silence/AdminShell";
 import { GlassCard } from "@/components/silence/GlassCard";
 import {
-  listProviders, upsertProvider, deleteProvider, toggleProvider, getProviderSecrets,
+  listProviders, upsertProvider, deleteProvider, toggleProvider,
   type ProviderRow,
 } from "@/lib/providers.functions";
 import {
-  listTokens, upsertToken, deleteToken, toggleToken, testToken, getTokenSecret,
+  listTokens, upsertToken, deleteToken, toggleToken, testToken,
   type ProviderTokenRow,
 } from "@/lib/provider-tokens.functions";
 import { useState } from "react";
@@ -52,7 +52,6 @@ function ProvidersPage() {
   const upsert = useServerFn(upsertProvider);
   const del = useServerFn(deleteProvider);
   const toggle = useServerFn(toggleProvider);
-  const getSecrets = useServerFn(getProviderSecrets);
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["providers"], queryFn: () => list() });
   const providerRows = Array.isArray(q.data) ? q.data : [];
@@ -94,20 +93,17 @@ function ProvidersPage() {
     onError: (e: any) => toast.error(e?.message ?? "Failed"),
   });
 
-  async function beginEdit(p: ProviderRow) {
-    try {
-      const s = await getSecrets({ data: { id: p.id } });
-      setForm({
-        id: p.id, name: p.name, base_url: s.base_url,
-        headers_json: s.headers_json, enabled: p.enabled,
-        priority: p.priority, notes: p.notes ?? "",
-        rpm_limit: p.rpm_limit, rps_limit: p.rps_limit,
-        hourly_limit: (p as any).hourly_limit ?? 0,
-        daily_limit: p.daily_limit, monthly_limit: p.monthly_limit,
-        requires_auth: (p as any).requires_auth !== false,
-      });
-      setOpen(true);
-    } catch (e: any) { toast.error(e?.message ?? "Failed"); }
+  function beginEdit(p: ProviderRow) {
+    setForm({
+      id: p.id, name: p.name, base_url: "",
+      headers_json: "", enabled: p.enabled,
+      priority: p.priority, notes: p.notes ?? "",
+      rpm_limit: p.rpm_limit, rps_limit: p.rps_limit,
+      hourly_limit: (p as any).hourly_limit ?? 0,
+      daily_limit: p.daily_limit, monthly_limit: p.monthly_limit,
+      requires_auth: (p as any).requires_auth !== false,
+    });
+    setOpen(true);
   }
 
   return (
@@ -200,30 +196,15 @@ function ProviderModal({ form, setForm, onClose, onSave, saving }: { form: Provi
             className="space-y-6 pb-6">
 
             <div className="panel blue">
-              <div className="panel-title">PRESETS & IDENTITY</div>
-              <div className="mb-4 flex flex-wrap items-center gap-2">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground opacity-60">Presets:</span>
-                <button type="button" onClick={() => setForm({
-                  ...form,
-                  name: form.name || "General Compute",
-                  base_url: "https://api.generalcompute.com/v1",
-                  rpm_limit: 100, rps_limit: 0, hourly_limit: 0,
-                  daily_limit: 50000, monthly_limit: 0,
-                })} className="rounded-full glass ring-metallic px-3 py-1 text-[11px] font-medium hover:bg-primary/10 transition-colors">General Compute</button>
-                <button type="button" onClick={() => setForm({ ...form, name: form.name || "OpenAI", base_url: "https://api.openai.com/v1" })}
-                  className="rounded-full glass ring-metallic px-3 py-1 text-[11px] font-medium hover:bg-primary/10 transition-colors">OpenAI</button>
-                <button type="button" onClick={() => setForm({ ...form, name: form.name || "Groq", base_url: "https://api.groq.com/openai/v1" })}
-                  className="rounded-full glass ring-metallic px-3 py-1 text-[11px] font-medium hover:bg-primary/10 transition-colors">Groq</button>
-              </div>
-              
+              <div className="panel-title">IDENTITY</div>
               <div className="field">
                 <div className="field-label">Name</div>
-                <input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className={inp} placeholder="OpenAI, Groq, Together…" />
+                <input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className={inp} placeholder="Provider name" />
               </div>
               
               <div className="field">
                 <div className="field-label">Base URL <span className="hint">(OpenAI-compatible)</span></div>
-                <input required={!form.id} value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} className={inp} placeholder="https://api.openai.com/v1" />
+                <input required={!form.id} value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} className={inp} placeholder="Enter secure endpoint" />
               </div>
             </div>
 
@@ -338,7 +319,6 @@ function TokensSection({ providerId }: { providerId: string }) {
   const del = useServerFn(deleteToken);
   const toggle = useServerFn(toggleToken);
   const test = useServerFn(testToken);
-  const getSecret = useServerFn(getTokenSecret);
   const qc = useQueryClient();
   const key = ["provider-tokens", providerId];
   const q = useQuery({ queryKey: key, queryFn: () => list({ data: { provider_id: providerId } }) });
@@ -376,16 +356,13 @@ function TokensSection({ providerId }: { providerId: string }) {
     onError: (e: any) => toast.error(e?.message ?? "Test failed"),
   });
 
-  async function beginEdit(t: ProviderTokenRow) {
-    try {
-      const s = await getSecret({ data: { id: t.id } });
-      setForm({
-        id: t.id, provider_id: providerId, label: t.label, api_key: s.api_key,
-        enabled: t.enabled, priority: t.priority, balance: Number(t.balance),
-        notes: t.notes ?? "",
-      });
-      setOpen(true);
-    } catch (e: any) { toast.error(e?.message ?? "Failed"); }
+  function beginEdit(t: ProviderTokenRow) {
+    setForm({
+      id: t.id, provider_id: providerId, label: t.label, api_key: "",
+      enabled: t.enabled, priority: t.priority, balance: Number(t.balance),
+      notes: t.notes ?? "",
+    });
+    setOpen(true);
   }
 
   return (

@@ -10,8 +10,8 @@ export const Route = createFileRoute("/api/public/v1/chat/completions")({
           const cl = Number(request.headers.get("content-length") ?? "0");
           if (cl > 2_000_000) return json({ error: { message: "Request body too large (max 2MB)" } }, 413);
           return await handleChat(request);
-        } catch (e: any) {
-          return json({ error: { message: e?.message ?? "internal error", type: "gateway_error" } }, 500);
+        } catch {
+          return json({ error: { message: "Internal gateway error", type: "gateway_error" } }, 500);
         }
       },
     },
@@ -53,7 +53,6 @@ async function handleChat(request: Request): Promise<Response> {
         status: 200,
         headers: {
           "content-type": "application/json",
-          "x-silence-token": r.tokenId,
           "x-silence-latency-ms": String(Date.now() - started),
           ...cors(),
         },
@@ -66,7 +65,6 @@ async function handleChat(request: Request): Promise<Response> {
         "cache-control": "no-cache",
         "x-accel-buffering": "no",
         "connection": "keep-alive",
-        "x-silence-token": r.tokenId,
         "x-silence-latency-ms": String(Date.now() - started),
         ...cors(),
       },
@@ -76,7 +74,6 @@ async function handleChat(request: Request): Promise<Response> {
     status: 200,
     headers: {
       "content-type": "application/json",
-      "x-silence-token": r.tokenId,
       "x-silence-latency-ms": String(Date.now() - started),
       ...cors(),
     },

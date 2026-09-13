@@ -3,6 +3,7 @@ import { LayoutDashboard, Activity, Cpu, KeyRound, LogOut, Menu, X } from "lucid
 import { useState, type ReactNode } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
+import { BrandLogo } from "@/components/silence/BrandLogo";
 
 const NAV = [
   { to: "/user/dashboard", label: "Overview", icon: LayoutDashboard },
@@ -24,9 +25,7 @@ export function UserShell({ children, email }: { children: ReactNode; email?: st
   const SidebarInner = (
     <>
       <Link to="/user/dashboard" onClick={() => setOpen(false)} className="mb-5 flex items-center gap-2.5 px-2 py-1">
-        <div className="grid h-9 w-9 place-items-center rounded-xl btn-primary text-white">
-          <span className="text-base font-bold">S</span>
-        </div>
+        <BrandLogo className="h-9 w-9" />
         <div className="flex flex-col leading-tight">
           <span className="text-sm font-semibold tracking-tight">Silence<span className="text-[color:var(--brand)]">API</span></span>
           <span className="text-[10px] uppercase tracking-wider text-muted-foreground">User Portal</span>
@@ -69,9 +68,7 @@ export function UserShell({ children, email }: { children: ReactNode; email?: st
       {/* Mobile top bar */}
       <div className="sticky top-0 z-30 flex items-center justify-between border-b border-[color:var(--hairline)] bg-background/85 px-4 py-3 backdrop-blur md:hidden">
         <Link to="/user/dashboard" className="flex items-center gap-2">
-          <div className="grid h-8 w-8 place-items-center rounded-lg btn-primary text-white">
-            <span className="text-sm font-bold">S</span>
-          </div>
+          <BrandLogo className="h-8 w-8" />
           <span className="font-semibold tracking-tight">Silence<span className="text-[color:var(--brand)]">API</span></span>
         </Link>
         <button aria-label="Toggle navigation" onClick={() => setOpen(true)} className="rounded-lg border border-[color:var(--hairline)] bg-card p-2 shadow-sm transition-colors hover:bg-accent">

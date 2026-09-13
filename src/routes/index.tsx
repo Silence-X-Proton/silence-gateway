@@ -1,5 +1,13 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { ShieldCheck, Zap, GitBranch, LineChart, Lock, Radio, ArrowRight, Sparkles, Check, Copy, Terminal, Boxes } from "lucide-react";
+import claudeLogo from "@/assets/models/claude.webp";
+import openaiLogo from "@/assets/models/openai.png";
+import geminiLogo from "@/assets/models/gemini.png";
+import mistralLogo from "@/assets/models/mistral.png";
+import perplexityLogo from "@/assets/models/perplexity.png";
+import grokLogo from "@/assets/models/grok.png";
+import deepseekLogo from "@/assets/models/deepseek.png";
+import { BrandLogo } from "@/components/silence/BrandLogo";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -30,12 +38,104 @@ const STEPS = [
   { n: "03", t: "Issue a key & ship", d: "Point any OpenAI or Anthropic SDK at Silence. That's it." },
 ];
 
-const COMPAT = [
-  { t: "OpenAI SDK", d: "/v1/chat/completions" },
-  { t: "Anthropic SDK", d: "/v1/messages" },
-  { t: "Claude Code", d: "ANTHROPIC_BASE_URL" },
-  { t: "cURL / any HTTP", d: "REST + SSE" },
+const PROVIDERS = [
+  { name: "Claude", caption: "Anthropic", logo: claudeLogo, position: "gateway-provider-claude" },
+  { name: "OpenAI", caption: "Open models", logo: openaiLogo, position: "gateway-provider-openai" },
+  { name: "Gemini", caption: "Google AI", logo: geminiLogo, position: "gateway-provider-gemini" },
+  { name: "Mistral", caption: "Open weights", logo: mistralLogo, position: "gateway-provider-mistral" },
+  { name: "Perplexity", caption: "Search AI", logo: perplexityLogo, position: "gateway-provider-perplexity" },
+  { name: "Grok", caption: "xAI", logo: grokLogo, position: "gateway-provider-grok" },
+  { name: "DeepSeek", caption: "Reasoning AI", logo: deepseekLogo, position: "gateway-provider-deepseek" },
 ];
+
+function GatewayEngine() {
+  return (
+    <section className="gateway-section" aria-labelledby="gateway-engine-title">
+      <div className="gateway-container">
+        <div className="gateway-intro">
+          <span className="gateway-eyebrow"><span className="gateway-status-dot" /> The multi-model gateway</span>
+          <h2 id="gateway-engine-title">Many models. <span>One silent engine.</span></h2>
+          <p>Your application, connected to a world of intelligence. Silence Gateway sits at the center.</p>
+        </div>
+
+        <div className="gateway-panel">
+          <div className="gateway-panel-top">
+            <div className="gateway-panel-label"><Radio aria-hidden="true" /> Routing architecture</div>
+            <span className="gateway-preview-label">Illustrative preview</span>
+          </div>
+
+          <div className="gateway-stage">
+            <svg className="gateway-connections" viewBox="0 0 1000 560" aria-hidden="true" preserveAspectRatio="none">
+              <defs>
+                <linearGradient id="gateway-line" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0" stopColor="var(--gateway-line)" />
+                  <stop offset="0.5" stopColor="var(--gateway-accent)" />
+                  <stop offset="1" stopColor="var(--gateway-line)" />
+                </linearGradient>
+                <filter id="gateway-particle-glow" x="-100%" y="-100%" width="300%" height="300%">
+                  <feGaussianBlur stdDeviation="3" result="blur" />
+                  <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+                </filter>
+              </defs>
+              <g className="gateway-wire-set">
+                <path d="M145 125 C270 145 370 225 500 280" />
+                <path d="M500 65 C500 135 500 205 500 280" />
+                <path d="M855 125 C730 145 630 225 500 280" />
+                <path d="M895 280 C760 280 650 280 500 280" />
+                <path d="M810 450 C690 420 610 350 500 280" />
+                <path d="M500 510 C500 430 500 355 500 280" />
+                <path d="M190 450 C310 420 390 350 500 280" />
+              </g>
+              <g className="gateway-wire-glow">
+                <path d="M145 125 C270 145 370 225 500 280" />
+                <path d="M500 65 C500 135 500 205 500 280" />
+                <path d="M855 125 C730 145 630 225 500 280" />
+                <path d="M895 280 C760 280 650 280 500 280" />
+                <path d="M810 450 C690 420 610 350 500 280" />
+                <path d="M500 510 C500 430 500 355 500 280" />
+                <path d="M190 450 C310 420 390 350 500 280" />
+              </g>
+              <g className="gateway-particles">
+                <circle cx="145" cy="125" r="2.5" /><circle cx="500" cy="65" r="2.5" />
+                <circle cx="855" cy="125" r="2.5" /><circle cx="895" cy="280" r="2.5" />
+                <circle cx="810" cy="450" r="2.5" /><circle cx="500" cy="510" r="2.5" />
+                <circle cx="190" cy="450" r="2.5" />
+              </g>
+            </svg>
+
+            <span className="gateway-orbit gateway-orbit-one" aria-hidden="true" />
+            <span className="gateway-orbit gateway-orbit-two" aria-hidden="true" />
+
+            <div className="gateway-hub">
+              <BrandLogo className="gateway-hub-logo" />
+              <div className="gateway-hub-name">Silence</div>
+              <div className="gateway-hub-type">Gateway</div>
+              <div className="gateway-hub-bars" aria-hidden="true">
+                {[0, 1, 2, 3, 4].map((bar) => <span key={bar} />)}
+              </div>
+            </div>
+
+            {PROVIDERS.map((provider) => (
+              <div key={provider.name} className={`gateway-provider ${provider.position}`} data-provider={provider.name}>
+                <div className="gateway-provider-image"><img src={provider.logo} alt={`${provider.name} model provider`} /></div>
+                <div className="gateway-provider-name">{provider.name}</div>
+                <div className="gateway-provider-caption">{provider.caption}</div>
+                <span className="gateway-provider-port" aria-hidden="true" />
+              </div>
+            ))}
+          </div>
+
+          <div className="gateway-panel-bottom">
+            <div className="gateway-flow-legend"><span>Application</span><span className="gateway-flow-arrow">→</span><span className="gateway-flow-current">Silence Gateway</span><span className="gateway-flow-arrow">→</span><span>Model providers</span></div>
+            <div className="gateway-architecture"><span className="gateway-status-dot" /> One unified entry point</div>
+          </div>
+        </div>
+
+        <div className="gateway-section-footer"><ShieldCheck aria-hidden="true" /> One connection to route, protect, and scale every model.</div>
+      </div>
+    </section>
+  );
+}
 
 function Landing() {
   return (
@@ -43,9 +143,7 @@ function Landing() {
       <div aria-hidden className="pointer-events-none absolute inset-x-0 top-0 h-[560px] hero-grid" />
       <header className="relative z-10 mx-auto flex max-w-6xl items-center justify-between px-4 py-4 sm:px-6 sm:py-6">
         <Link to="/" className="flex items-center gap-2.5">
-          <div className="grid h-9 w-9 place-items-center rounded-xl btn-primary text-white">
-            <span className="text-base font-bold tracking-tight">S</span>
-          </div>
+          <BrandLogo className="h-9 w-9" />
           <span className="text-[17px] font-semibold tracking-tight">
             Silence<span className="text-[color:var(--brand)]">API</span>
           </span>
@@ -134,40 +232,7 @@ resp = client.chat.completions.create({"\n"}
           </div>
         </section>
 
-        {/* Compatibility strip */}
-        <section className="mt-14 rounded-2xl border border-[color:var(--hairline)] bg-white/70 p-4 backdrop-blur sm:mt-16 sm:p-5">
-          <div className="mb-3 flex items-center gap-2 px-1 text-[11px] uppercase tracking-widest text-muted-foreground">
-            <span className="h-px flex-1 bg-[color:var(--hairline)]" />
-            Drop-in compatible with
-            <span className="h-px flex-1 bg-[color:var(--hairline)]" />
-          </div>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {COMPAT.map((c) => (
-              <div key={c.t} className="rounded-xl border border-[color:var(--hairline)] bg-white px-4 py-3 text-center">
-                <div className="text-sm font-semibold">{c.t}</div>
-                <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">{c.d}</div>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        {/* Stat strip */}
-        <section className="mt-14 grid grid-cols-2 gap-3 sm:mt-16 sm:grid-cols-4 sm:gap-4">
-          {[
-            { icon: GitBranch, k: "Unlimited", v: "Model Providers" },
-            { icon: ShieldCheck, k: "AES-256", v: "Encrypted secrets" },
-            { icon: Zap, k: "99.9%", v: "Uptime SLA target" },
-            { icon: LineChart, k: "Real-time", v: "Logs & Analytics" },
-          ].map((s) => (
-            <div key={s.v} className="card-3d rounded-2xl p-4">
-              <div className="grid h-10 w-10 place-items-center rounded-xl bg-[color:var(--brand-soft)] text-[color:var(--brand-strong)]">
-                <s.icon className="h-4 w-4" />
-              </div>
-              <div className="mt-3 text-lg font-bold tracking-tight sm:text-xl">{s.k}</div>
-              <div className="text-xs text-muted-foreground sm:text-sm">{s.v}</div>
-            </div>
-          ))}
-        </section>
+        <GatewayEngine />
 
         {/* Features */}
         <section id="features" className="mt-20">

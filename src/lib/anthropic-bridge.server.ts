@@ -9,7 +9,7 @@ export function cors() {
     "access-control-allow-methods": "POST, OPTIONS",
     "access-control-allow-headers":
       "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-app, user-agent",
-    "access-control-expose-headers": "x-silence-token, x-silence-latency-ms, request-id",
+    "access-control-expose-headers": "x-silence-latency-ms, request-id",
   } as Record<string, string>;
 }
 
@@ -700,10 +700,9 @@ export async function handleMessages(request: Request): Promise<Response> {
     return jsonResp({ type: "error", error: { type: mapErrType(r.status), message: r.body.slice(0, 500) } }, r.status);
   }
 
-  const sseHeaders = (tokenId: string) => ({
+  const sseHeaders = () => ({
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
-    "x-silence-token": tokenId,
     "x-silence-latency-ms": String(Date.now() - started),
     ...cors(),
   });
@@ -711,23 +710,23 @@ export async function handleMessages(request: Request): Promise<Response> {
   if (r.kind === "stream") {
     if (prompted) {
       if (wantStream) {
-        return new Response(translatePromptedStream(r.body, modelName), { status: 200, headers: sseHeaders(r.tokenId) });
+        return new Response(translatePromptedStream(r.body, modelName), { status: 200, headers: sseHeaders() });
       }
       // Client wants JSON but we streamed upstream — aggregate, then convert.
       const oaiAgg = await collectOpenAIStream(r.body);
       return new Response(JSON.stringify(promptedToAnth(oaiAgg, modelName)), {
         status: 200,
-        headers: { "content-type": "application/json", "x-silence-token": r.tokenId, "x-silence-latency-ms": String(Date.now() - started), ...cors() },
+        headers: { "content-type": "application/json", "x-silence-latency-ms": String(Date.now() - started), ...cors() },
       });
     }
     if (!wantStream) {
       const oaiAgg = await collectOpenAIStream(r.body);
       return new Response(JSON.stringify(openaiToAnth(oaiAgg, modelName)), {
         status: 200,
-        headers: { "content-type": "application/json", "x-silence-token": r.tokenId, "x-silence-latency-ms": String(Date.now() - started), ...cors() },
+        headers: { "content-type": "application/json", "x-silence-latency-ms": String(Date.now() - started), ...cors() },
       });
     }
-    return new Response(translateStream(r.body, modelName), { status: 200, headers: sseHeaders(r.tokenId) });
+    return new Response(translateStream(r.body, modelName), { status: 200, headers: sseHeaders() });
   }
 
   // Upstream ignored `stream` and returned a buffered JSON body.
@@ -736,13 +735,12 @@ export async function handleMessages(request: Request): Promise<Response> {
   const anth = prompted ? promptedToAnth(oai, modelName) : openaiToAnth(oai, modelName);
 
   if (prompted && wantStream) {
-    return new Response(syntheticAnthStream(anth), { status: 200, headers: sseHeaders(r.tokenId) });
+    return new Response(syntheticAnthStream(anth), { status: 200, headers: sseHeaders() });
   }
   return new Response(JSON.stringify(anth), {
     status: 200,
     headers: {
       "content-type": "application/json",
-      "x-silence-token": r.tokenId,
       "x-silence-latency-ms": String(Date.now() - started),
       ...cors(),
     },
