@@ -24,6 +24,117 @@ const providerSecretCache = new Map<
   { baseUrl: string; extraHeaders: Record<string, string> }
 >();
 
+// ---------------------------------------------------------------------------
+// TTL caches (fix #6 — heavy DB fan-out per request on Cloudflare)
+// Every Supabase round-trip from a Worker edge costs ~50-150ms of TTFB.
+// Models, providers and provider token LISTS change rarely (admin edits only),
+// so they are served from an in-isolate cache with short TTLs. Cooldown state
+// is re-evaluated live from cooldown_until timestamps at request time.
+// SECURITY: api_keys, IP bans, suspensions, freezes and the per-request RPM
+// reservation are NEVER cached — they must stay fresh on every request.
+// ---------------------------------------------------------------------------
+const modelCache = new Map<string, { row: any; until: number }>();
+const providerCache = new Map<string, { row: any; until: number }>();
+const tokensCache = new Map<string, { rows: any[]; until: number }>();
+const MODEL_TTL = 60_000;
+const PROVIDER_TTL = 60_000;
+const TOKENS_TTL = 30_000;
+
+function mapGetFresh(m: Map<string, any>, k: string): any {
+  const hit = m.get(k);
+  if (!hit) return null;
+  if (hit.until <= Date.now()) { m.delete(k); return null; }
+  return hit;
+}
+
+// Global per-user token total (gw_get_user_token_total) — soft limit gauge.
+// 20s cache: worst case a user slightly overshoots their token cap for 20s,
+// in exchange for two fewer sequential round-trips on EVERY request.
+const userTokenTotalCache = new Map<string, { total: number; until: number }>();
+async function getUserTokenTotal(sb: any, userId: string): Promise<number> {
+  const hit = userTokenTotalCache.get(userId);
+  if (hit && hit.until > Date.now()) return hit.total;
+  let total = 0;
+  try {
+    const { data } = await sb.rpc("gw_get_user_token_total" as any, { _user_id: userId });
+    total = Number(data ?? 0);
+  } catch {}
+  if (userTokenTotalCache.size > 256) userTokenTotalCache.clear();
+  userTokenTotalCache.set(userId, { total, until: Date.now() + 20_000 });
+  return total;
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated owner bypass ("owner API pe limit na lage, user pe rahe")
+// A key gets user-side BLOCKING limits lifted ONLY if its *authenticated*
+// owner is an admin/owner in the database (admins table or user_roles
+// owner|admin). Hard security properties:
+//   - No client-controlled header can grant the bypass.
+//   - Regular user keys are completely unaffected: spend guard, input/output
+//     caps, global token limit, cooldowns, daily/monthly token caps, RPM
+//     reservation, IP strikes and bans all still apply to them as before.
+//   - Owner usage is STILL debited and logged — only the blocking limits go.
+//   - Result cached 30s per user, so revoking owner rights takes effect ≤30s.
+// ---------------------------------------------------------------------------
+const ownerCache = new Map<string, { owner: boolean; until: number }>();
+const OWNER_TTL = 30_000;
+
+async function isOwnerUser(sb: any, userId: string | null | undefined): Promise<boolean> {
+  if (!userId) return false;
+  const hit = ownerCache.get(userId);
+  if (hit && hit.until > Date.now()) return hit.owner;
+  let owner = false;
+  try {
+    const [adm, role] = await Promise.all([
+      sb.from("admins").select("id").eq("id", userId).maybeSingle(),
+      sb.from("user_roles").select("id").eq("user_id", userId).in("role", ["owner", "admin"]).limit(1),
+    ]);
+    owner = !!adm?.data || !!(role?.data && role.data.length > 0);
+  } catch {}
+  if (ownerCache.size > 256) ownerCache.clear();
+  ownerCache.set(userId, { owner, until: Date.now() + OWNER_TTL });
+  return owner;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Race the first upstream byte against a deadline. On timeout the reader is
+// cancelled so the socket is released before failing over to the next token.
+function firstByteOrTimeout(reader: any, ms: number): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try { reader.cancel().catch(() => {}); } catch {}
+      reject(new Error(`no first byte within ${ms}ms`));
+    }, ms);
+    reader.read().then(
+      (r: any) => { clearTimeout(timer); resolve(r); },
+      (e: any) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Fast upstream-model masking (fix #7 — split().join() per chunk)
+// A precompiled RegExp (cached per upstream model id) replaces every
+// occurrence of the upstream id with the public alias in ONE pass.
+// ---------------------------------------------------------------------------
+const maskRegexCache = new Map<string, RegExp | null>();
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function maskRegexFor(model: any): RegExp | null {
+  const up = String(model?.upstream_model ?? "");
+  const pub = String(model?.display_name ?? "");
+  if (!up || !pub || up === pub) return null;
+  let re = maskRegexCache.get(up);
+  if (re === undefined) {
+    re = new RegExp(escapeRegExp(up), "g");
+    if (maskRegexCache.size > 64) maskRegexCache.clear();
+    maskRegexCache.set(up, re);
+  }
+  return re;
+}
+
 export async function runGateway(request: Request, openaiBody: any): Promise<GatewayResult> {
   const clientIp =
     request.headers.get("cf-connecting-ip") ||
@@ -93,18 +204,36 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
   }
   const wantStream = !!openaiBody.stream;
 
+  // Owner detection + global token-limit check run IN PARALLEL with the
+  // lookups below, so neither adds a sequential round-trip on the hot path.
+  const ownerPromise = isOwnerUser(supabaseAdmin, apiKey.user_id);
+  const tokenLimitPromise = (async () => {
+    if (!apiKey.user_id) return { blocked: false };
+    try {
+      const { data: userProfile } = await supabaseAdmin.from("profiles").select("*" as any).eq("id", apiKey.user_id).single();
+      const maxLimit = Number((userProfile as any)?.max_tokens_limit ?? 0);
+      if (!userProfile || !(maxLimit > 0)) return { blocked: false };
+      const total = await getUserTokenTotal(supabaseAdmin, apiKey.user_id);
+      return { blocked: total >= maxLimit };
+    } catch { return { blocked: false }; }
+  })();
+
   // Single query: match by display_name OR upstream_model. Cuts a second
   // round-trip on the common case where the caller passes upstream ids.
-  // Also parallel with the suspended-user check.
+  // Also parallel with the suspended-user check. Result TTL-cached.
+  const cachedModel = mapGetFresh(modelCache, modelName);
+  const modelPromise = cachedModel
+    ? Promise.resolve({ data: [cachedModel.row], error: null })
+    : (async () =>
+        supabaseAdmin
+          .from("models").select("*")
+          // Case-insensitive exact match (ilike without wildcards). Clients type
+          // `glm-5.2` while the catalog stores `Glm-5.2`; an eq match 404'd those.
+          // modelName is already restricted to a safe character allow-list above.
+          .or(`display_name.ilike.${modelName},upstream_model.ilike.${modelName}`)
+          .eq("enabled", true).limit(1))();
   const [modelRes, suspendedRes] = await Promise.all([
-    (async () =>
-      supabaseAdmin
-        .from("models").select("*")
-        // Case-insensitive exact match (ilike without wildcards). Clients type
-        // `glm-5.2` while the catalog stores `Glm-5.2`; an eq match 404'd those.
-        // modelName is already restricted to a safe character allow-list above.
-        .or(`display_name.ilike.${modelName},upstream_model.ilike.${modelName}`)
-        .eq("enabled", true).limit(1))(),
+    modelPromise,
     apiKey.user_id
       ? (async () => {
           try { return await supabaseAdmin.rpc("is_user_suspended", { _user_id: apiKey.user_id }); }
@@ -112,6 +241,7 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
         })()
       : Promise.resolve({ data: false }),
   ]);
+  const isOwner = await ownerPromise;
   if ((suspendedRes as any)?.data) {
     return { kind: "error", status: 403, body: { error: { message: "Account suspended. Contact admin.", type: "account_suspended" } } };
   }
@@ -126,21 +256,35 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
   if ((modelRes as any).error) return { kind: "error", status: 500, body: { error: { message: (modelRes as any).error.message } } };
   const model = (modelRes as any).data?.[0];
   if (!model) return { kind: "error", status: 404, body: { error: { message: `Model '${modelName}' not found`, type: "invalid_request" } } };
+  if (!cachedModel) {
+    if (modelCache.size > 128) modelCache.clear();
+    modelCache.set(modelName, { row: model, until: Date.now() + MODEL_TTL });
+  }
 
   // Fetch provider AND its tokens in parallel — tokens query filters by
   // provider_id which we already have from the model row. Cuts one full
-  // round-trip off TTFB on every request.
+  // round-trip off TTFB on every request. Both are TTL-cached (see above).
+  const cachedProvider = mapGetFresh(providerCache, model.provider_id);
+  const cachedTokens = mapGetFresh(tokensCache, model.provider_id);
   const [providerRes, tokensRes] = await Promise.all([
-    supabaseAdmin.from("providers").select("*").eq("id", model.provider_id).maybeSingle(),
-    supabaseAdmin
-      .from("provider_tokens").select("*")
-      .eq("provider_id", model.provider_id).eq("enabled", true)
-      .order("priority", { ascending: true })
-      .order("last_used_at", { ascending: true, nullsFirst: true }),
+    cachedProvider
+      ? Promise.resolve({ data: cachedProvider.row, error: null })
+      : supabaseAdmin.from("providers").select("*").eq("id", model.provider_id).maybeSingle(),
+    cachedTokens
+      ? Promise.resolve({ data: cachedTokens.rows, error: null })
+      : supabaseAdmin
+          .from("provider_tokens").select("*")
+          .eq("provider_id", model.provider_id).eq("enabled", true)
+          .order("priority", { ascending: true })
+          .order("last_used_at", { ascending: true, nullsFirst: true }),
   ]);
   const { data: provider, error: pErr } = providerRes as any;
   if (pErr || !provider) return { kind: "error", status: 500, body: { error: { message: "Provider missing" } } };
   if (!provider.enabled) return { kind: "error", status: 503, body: { error: { message: "Provider disabled" } } };
+  if (!cachedProvider) {
+    if (providerCache.size > 128) providerCache.clear();
+    providerCache.set(model.provider_id, { row: provider, until: Date.now() + PROVIDER_TTL });
+  }
 
   // Cache decrypted provider secrets. Keyed by id + updated_at so any
   // admin edit through the UI invalidates automatically.
@@ -166,14 +310,28 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
   } else {
     const { data: tokens, error: tErr } = tokensRes as any;
     if (tErr) return { kind: "error", status: 500, body: { error: { message: tErr.message } } };
+    if (!cachedTokens && tokens) {
+      if (tokensCache.size > 128) tokensCache.clear();
+      tokensCache.set(model.provider_id, { rows: tokens, until: Date.now() + TOKENS_TTL });
+    }
     usable = (tokens ?? []).filter((t: any) => {
+      // Authenticated owners bypass gateway-side token throttles (cooldown,
+      // daily/monthly caps, token balance). Upstream provider limits remain
+      // the final guard and the failover loop still rotates on 429/5xx.
+      if (isOwner) return true;
       if (t.cooldown_until && t.cooldown_until > nowIso) return false;
       if (t.daily_limit && t.requests_today >= t.daily_limit) return false;
       if (t.monthly_limit && t.requests_this_month >= t.monthly_limit) return false;
       if (Number(t.balance) <= 0) return false;
       return true;
     });
-    if (usable.length === 0) return { kind: "error", status: 429, body: { error: { message: "No available tokens (all cooling / exhausted)", type: "rate_limit" } } };
+    if (usable.length === 0) {
+      if (isOwner && (tokens ?? []).length > 0) {
+        usable = tokens;
+      } else {
+        return { kind: "error", status: 429, body: { error: { message: "No available tokens (all cooling / exhausted)", type: "rate_limit" } } };
+      }
+    }
 
     // Proactive load balancing: compute current-minute usage per token
     // (window resets after 60s) and sort by least-loaded first, so we
@@ -203,11 +361,11 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
   // reject anything the key cannot actually afford.
   const estInTok = estimatePromptTokens(openaiBody);
   const maxInCap = Number(provider.max_input_tokens || 0);
-  if (maxInCap > 0 && estInTok > maxInCap) {
+  if (!isOwner && maxInCap > 0 && estInTok > maxInCap) {
     return { kind: "error", status: 413, body: { error: { message: `Prompt too large: ~${estInTok} tokens exceeds the ${maxInCap} token limit for this model.`, type: "invalid_request" } } };
   }
   const maxOutCap = Number(provider.max_output_tokens || 0);
-  if (maxOutCap > 0) {
+  if (!isOwner && maxOutCap > 0) {
     const requested = Number(upstreamBody.max_tokens || 0);
     upstreamBody.max_tokens = requested > 0 ? Math.min(requested, maxOutCap) : maxOutCap;
   }
@@ -219,7 +377,9 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
     (estInTok / 1_000_000) * inPrice +
     (assumedOut / 1_000_000) * outPrice +
     Number(model.request_cost ?? 0);
-  if (worstCost > Number(apiKey.balance)) {
+  // Authenticated owners are exempt from the BLOCKING pre-flight check (their
+  // balance may go negative), but bumpUsage still debits and logs real spend.
+  if (!isOwner && worstCost > Number(apiKey.balance)) {
     return {
       kind: "error",
       status: 402,
@@ -232,13 +392,10 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
     };
   }
 
-  // Check token limit
-  if (apiKey.user_id) {
-    const { data: userProfile } = await supabaseAdmin.from("profiles").select("*" as any).eq("id", apiKey.user_id).single();
-    const { data: userStats } = await supabaseAdmin.rpc("gw_get_user_token_total" as any, { _user_id: apiKey.user_id });
-    if (userProfile && (userStats as any || 0) >= (userProfile as any).max_tokens_limit) {
-      return { kind: "error", status: 403, body: { error: { message: "Global token limit reached for this account.", type: "limit_exceeded" } } };
-    }
+  // Check global token limit (already resolved in parallel above).
+  const limitRes = await tokenLimitPromise;
+  if (!isOwner && limitRes.blocked) {
+    return { kind: "error", status: 403, body: { error: { message: "Global token limit reached for this account.", type: "limit_exceeded" } } };
   }
 
   // OpenAI-compatible streaming does NOT emit `usage` unless the client opts in.
@@ -256,6 +413,9 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
   let reservedToken: any = null;
   const tryReserve = async () => {
     if (keyless) { reservedToken = usable[0]; return true; }
+    // Authenticated owners skip the gateway-side per-minute reservation;
+    // the upstream provider's own limits + failover still protect the tokens.
+    if (isOwner) { reservedToken = usable[0]; return true; }
     for (const t of usable) {
       const { data: ok } = await supabaseAdmin.rpc("gw_reserve_token_slot", {
         _id: t.id, _rpm_limit: providerRpm,
@@ -383,15 +543,39 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
 
     const isSSE = wantStream && (res.headers.get("content-type") ?? "").includes("text/event-stream");
     if (isSSE && res.body) {
-      // Inline meter via TransformStream. On Cloudflare Workers, a background
-      // IIFE spawned after the Response returns is terminated — so tee() +
-      // fire-and-forget silently loses every streamed request. Piping the
-      // upstream body through a Transform keeps the worker context alive
-      // until the client body ends, and the flush() runs our DB writes.
-      // markUsed is deferred into flush() so it does NOT block first-byte.
-      const clientStream = createResilientUpstreamStream(res.body).pipeThrough(
-        createMeterTransform({ supabaseAdmin, apiKey, provider, model, token: t, attemptStart }),
-      );
+      // FIRST-BYTE PROBE (fix #5 pre-stream half). Previously a dead upstream
+      // was committed blindly: its death became a silent `data: [DONE]`, so
+      // the client got an EMPTY "successful" stream — OpenClaw/Claude Code
+      // showed a blank response with no retry. Now the upstream must prove
+      // itself with one byte before we commit; otherwise we fail over to the
+      // next token exactly like a 429/5xx. 60s budget: reasoning models may
+      // legitimately take long before the first byte.
+      const reader = res.body.getReader();
+      let first: any;
+      try {
+        first = await firstByteOrTimeout(reader, 60_000);
+      } catch (e: any) {
+        if (request.signal.aborted) {
+          return { kind: "error", status: 499, body: { error: { message: "Request cancelled by client", type: "request_cancelled" } } };
+        }
+        attempts.push({ reason: "no_first_byte" });
+        if (t.id !== "__keyless__") await cooldownToken(supabaseAdmin, t.id, 15, "unhealthy");
+        await logError(supabaseAdmin, { provider, model, token: t, status: null, message: "Upstream stalled before first byte", response: "", latency: Date.now() - attemptStart, result: "failover" });
+        await Promise.allSettled([
+          logUsage(supabaseAdmin, { apiKey, provider, model, token: t, cost: 0, inTok: 0, outTok: 0, latency: Date.now() - attemptStart, success: false }),
+          bumpUsage(supabaseAdmin, t, 0, 0, apiKey),
+        ]);
+        continue;
+      }
+      if (first.done) {
+        attempts.push({ reason: "empty_stream" });
+        continue;
+      }
+      // Committed: one pull-based resilient stream replaces the old
+      // resilient+meter pipe chain (fixes #1 #3 + the mid-stream half of #5).
+      const clientStream = createResilientSSEStream({
+        reader, first, request, supabaseAdmin, apiKey, provider, model, token: t, attemptStart,
+      });
       return { kind: "stream", body: clientStream, startedAt: attemptStart, ctx: { sb: supabaseAdmin, apiKey, provider, model, token: t, attemptStart } };
     }
 
@@ -438,54 +622,54 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
   };
 }
 
-// Convert an upstream TCP/body reset into a valid end-of-stream marker. Without
-// this boundary, fetch clients receive a network exception with no HTTP
-// response, and some SDKs then crash while reading `error.response`.
-function createResilientUpstreamStream(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
-  const reader = body.getReader();
-  const encoder = new TextEncoder();
-  let ended = false;
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      if (ended) return;
-      try {
-        const { value, done } = await reader.read();
-        if (done) {
-          ended = true;
-          controller.close();
-          return;
-        }
-        if (value) controller.enqueue(value);
-      } catch {
-        ended = true;
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
-      }
-    },
-    cancel(reason) {
-      ended = true;
-      void reader.cancel(reason);
-    },
-  });
-}
+// ---------------------------------------------------------------------------
+// Resilient SSE stream (fixes #1 #3 #4 #5 + the mid-stream cutoff "jugaad")
+// Replaces the old createResilientUpstreamStream + createMeterTransform pipe.
+// Failure-mode matrix:
+//
+//  - FIX #1: the usage parser keeps a partial-line buffer, and the final
+//    partial line without a trailing newline is ALSO parsed at stream end —
+//    a truncated upstream can no longer silently drop the last usage frame.
+//  - FIX #3 (backpressure): PULL-based. Upstream is read only when the client
+//    actually consumes, so a slow client can never balloon worker memory.
+//  - FIX #4 (abort): the upstream fetch already carries request.signal; when
+//    the client disconnects the next read() rejects, we cancel the upstream
+//    reader, flush metering exactly once and close. No orphaned work.
+//  - FIX #5 mid-stream: an upstream death emits a proper retryable OpenAI
+//    SSE error frame instead of a fake `data: [DONE]` — the client SDK knows
+//    the response was interrupted and can retry, instead of presenting a
+//    truncated answer as complete.
+//  - JUGAAD (streaming band ho jaati hai): `: ping` SSE comments every 15s
+//    during upstream silence keep Cloudflare's proxy and client sockets hot
+//    through long reasoning pauses. SSE comments are ignored by every
+//    conformant parser and never touch the provider payload.
+//  - Metering (balance debit + usage_events) runs EXACTLY once, on
+//    done/error/cancel — it can never double-charge, and a partial stream is
+//    billed only for the tokens actually delivered.
+//  - Model-id masking: precompiled regex + carry buffer so an id split across
+//    chunks is still masked (surrogate-pair safe), single pass, no
+//    split().join() array allocations per chunk.
+// ---------------------------------------------------------------------------
+const SSE_KEEPALIVE_MS = 15_000;
 
-// TransformStream that forwards SSE chunks untouched to the client while
-// parsing the trailing `usage` frame. On flush() (stream end) it debits
-// balance and writes the usage_events row. Because the returned Response
-// body pipes through this Transform, Cloudflare Workers keep the request
-// context alive until flush() resolves — no lost writes.
-function createMeterTransform(
-  ctx: { supabaseAdmin: any; apiKey: any; provider: any; model: any; token: any; attemptStart: number },
-): TransformStream<Uint8Array, Uint8Array> {
+function createResilientSSEStream(o: {
+  reader: any; first: any; request: Request;
+  supabaseAdmin: any; apiKey: any; provider: any; model: any; token: any; attemptStart: number;
+}): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  let buf = "";
-  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  const { supabaseAdmin: sb, apiKey, provider, model, token, attemptStart } = o;
+
+  let buf = "";          // partial SSE line buffer (usage parser)
+  let carry = "";        // held-back tail for cross-chunk model masking
   let inTok = 0, outTok = 0, reasoningTok = 0;
-  const parseChunk = (text: string) => {
-    buf += text;
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
+  let finalized = false;
+  let closed = false;
+  const re = maskRegexFor(model);
+  const pubName = String(model?.display_name ?? "");
+  const holdBack = re ? String(model.upstream_model).length - 1 : 0;
+
+  const processLines = (lines: string[]) => {
     for (const line of lines) {
       const l = line.trim();
       if (!l.startsWith("data:")) continue;
@@ -503,42 +687,114 @@ function createMeterTransform(
       } catch {}
     }
   };
-  return new TransformStream<Uint8Array, Uint8Array>({
-    start(controller) {
-      // Valid SSE comment frames keep quiet reasoning requests flowing through
-      // buffering proxies without changing the provider payload.
-      heartbeat = setInterval(() => {
-        try { controller.enqueue(encoder.encode(": silence-heartbeat\n\n")); } catch {}
-      }, 15_000);
-    },
-    transform(chunk, controller) {
-      let text = "";
-      try { text = decoder.decode(chunk, { stream: true }); } catch {}
-      if (text) {
-        // Same upstream-model leak as the non-streaming path, but per SSE frame.
-        controller.enqueue(encoder.encode(maskUpstreamModel(text, ctx.model)));
-        try { parseChunk(text); } catch {}
-      } else {
-        controller.enqueue(chunk);
+  const parseLines = (final: boolean) => {
+    if (!final) {
+      if (!buf.includes("\n")) return;
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      processLines(lines);
+    } else {
+      if (buf) processLines([buf]);
+      buf = "";
+    }
+  };
+
+  const emitMasked = (raw: string): Uint8Array | null => {
+    const out = carry + raw;
+    if (!re) { carry = ""; return encoder.encode(out); }
+    if (out.length <= holdBack) { carry = out; return null; }
+    let emitPart = out.slice(0, out.length - holdBack);
+    carry = out.slice(out.length - holdBack);
+    // Never cut a UTF-16 surrogate pair in half — push a trailing high
+    // surrogate back into the carry buffer.
+    while (emitPart.length && emitPart.charCodeAt(emitPart.length - 1) >= 0xd800 && emitPart.charCodeAt(emitPart.length - 1) <= 0xdbff) {
+      carry = emitPart[emitPart.length - 1] + carry;
+      emitPart = emitPart.slice(0, -1);
+    }
+    return encoder.encode(emitPart.replace(re, pubName));
+  };
+
+  const finalize = async (abnormal: boolean) => {
+    if (finalized) return;
+    finalized = true;
+    try { parseLines(true); } catch {}
+    if (reasoningTok && outTok < reasoningTok) outTok += reasoningTok;
+    const inCost = (inTok / 1_000_000) * Number(model.input_cost_per_1m ?? model.user_cost_per_1m ?? 0);
+    const outCost = (outTok / 1_000_000) * Number(model.output_cost_per_1m ?? model.user_cost_per_1m ?? 0);
+    const cost = inCost + outCost + Number(model.request_cost ?? 0);
+    await Promise.allSettled([
+      bumpUsage(sb, token, cost, inTok + outTok, apiKey),
+      logUsage(sb, {
+        apiKey, provider, model, token,
+        cost, inTok, outTok,
+        latency: Date.now() - attemptStart, success: !abnormal,
+      }),
+      token.id !== "__keyless__" ? markUsed(sb, token.id) : Promise.resolve(),
+    ]);
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (closed) return;
+      // First pull emits the chunk the caller already probed — minimal TTFB.
+      if (o.first) {
+        const f = o.first;
+        (o as any).first = null;
+        const text = decoder.decode(f.value, { stream: true });
+        parseLines(false);
+        const masked = emitMasked(text);
+        if (masked) controller.enqueue(masked);
+        return;
+      }
+      try {
+        for (;;) {
+          const step: any = await Promise.race([
+            o.reader.read(),
+            sleep(SSE_KEEPALIVE_MS).then(() => "keepalive"),
+          ]);
+          if (step === "keepalive") {
+            // Upstream silent (long reasoning pause). Emit an SSE comment to
+            // keep the connection hot through Cloudflare's proxy.
+            controller.enqueue(encoder.encode(": ping\n\n"));
+            continue;
+          }
+          const { value, done } = step;
+          if (done) {
+            closed = true;
+            const tail = carry + decoder.decode();
+            carry = "";
+            if (tail) controller.enqueue(encoder.encode(re ? tail.replace(re, pubName) : tail));
+            parseLines(true);
+            await finalize(false);
+            controller.close();
+            return;
+          }
+          const text = decoder.decode(value, { stream: true });
+          parseLines(false);
+          const masked = emitMasked(text);
+          if (masked) controller.enqueue(masked);
+          return; // one upstream chunk per pull → downstream sets the pace
+        }
+      } catch (e: any) {
+        // Upstream died mid-stream, or the client disconnected (request.signal
+        // aborts the upstream fetch). Close gracefully with an honest,
+        // retryable error frame — never a fake [DONE].
+        closed = true;
+        await finalize(true);
+        try {
+          if (!o.request.signal.aborted) {
+            controller.enqueue(encoder.encode(
+              `data: ${JSON.stringify({ error: { message: "Upstream stream interrupted mid-response. Safe to retry — billed only for tokens delivered.", type: "upstream_error", retryable: true } })}\n\n`,
+            ));
+          }
+          controller.close();
+        } catch {}
       }
     },
-    async flush() {
-      if (heartbeat) clearInterval(heartbeat);
-      try { parseChunk(decoder.decode()); } catch {}
-      if (reasoningTok && outTok < reasoningTok) outTok += reasoningTok;
-      const { model, apiKey, token, provider, supabaseAdmin: sb, attemptStart } = ctx;
-      const inCost = (inTok / 1_000_000) * Number(model.input_cost_per_1m ?? model.user_cost_per_1m ?? 0);
-      const outCost = (outTok / 1_000_000) * Number(model.output_cost_per_1m ?? model.user_cost_per_1m ?? 0);
-      const cost = inCost + outCost + Number(model.request_cost ?? 0);
-      await Promise.allSettled([
-        bumpUsage(sb, token, cost, inTok + outTok, apiKey),
-        logUsage(sb, {
-          apiKey, provider, model, token,
-          cost, inTok, outTok,
-          latency: Date.now() - attemptStart, success: true,
-        }),
-        token.id !== "__keyless__" ? markUsed(sb, token.id) : Promise.resolve(),
-      ]);
+    async cancel(reason) {
+      closed = true;
+      try { await o.reader.cancel(reason); } catch {}
+      await finalize(true);
     },
   });
 }
@@ -551,12 +807,15 @@ async function cooldownToken(sb: any, id: string, secs: number, health: string) 
 /**
  * Replace every occurrence of the upstream model id with the gateway's public
  * alias so responses never disclose the underlying vendor/model.
+ * Single-pass regex replace (fix #7) — the old split().join() allocated two
+ * arrays per SSE chunk; the precompiled matcher allocates none.
  */
 function maskUpstreamModel(text: string, model: any): string {
   const up = String(model?.upstream_model ?? "");
   const pub = String(model?.display_name ?? "");
   if (!up || !pub || up === pub || !text.includes(up)) return text;
-  return text.split(up).join(pub);
+  const re = maskRegexFor(model);
+  return re ? text.replace(re, pub) : text;
 }
 
 /**

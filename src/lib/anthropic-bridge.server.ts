@@ -143,7 +143,9 @@ export function anthToOpenAI(body: any) {
     const toolInstr = [
       "# Tool Use Protocol",
       "You have access to the following tools. To invoke a tool, output ONE OR MORE tool call blocks EXACTLY in this format:",
-      `<tool_call>{"name":"<tool_name>","arguments":{ ...json args... }}</tool_call>`,
+      "<tool_call>",
+      `{"name":"<tool_name>","arguments":{ ...json args... }}`,
+      "</tool_call>",
       "Rules:",
       "- Use ONLY tools listed below. Arguments MUST be valid JSON matching the input schema.",
       "- Emit multiple <tool_call> blocks in the same response when parallel calls are useful.",
@@ -240,7 +242,7 @@ function safeParse(s: any) { try { return JSON.parse(s); } catch { return s ?? {
 // Returns cleaned text (blocks removed) and parsed tool_use blocks.
 export function extractPromptedToolCalls(text: string): { cleanText: string; toolUses: Array<{ id: string; name: string; input: any }> } {
   const toolUses: Array<{ id: string; name: string; input: any }> = [];
-  const re = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  const re = /\s*<tool_call>([\s\S]*?)\s*<\/tool_call>/g;
   let cleanText = text.replace(re, (_m, inner) => {
     let obj: any = null;
     try { obj = JSON.parse(inner); } catch {
@@ -307,130 +309,156 @@ export function translateStream(upstream: ReadableStream<Uint8Array>, modelName:
   let inputTokens = 0;
   let outputTokens = 0;
   let stopReason = "end_turn";
-  const nativeToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+  let upstreamFailed = false;
+  let finished = false;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
   let buf = "";
 
   const sse = (event: string, data: any) =>
     encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
   const reader = upstream.getReader();
-  return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let finished = false;
-      const heartbeat = setInterval(() => {
-        if (!finished) controller.enqueue(sse("ping", { type: "ping" }));
-      }, 15_000);
-      try {
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const lines = buf.split("\n");
-          buf = lines.pop() ?? "";
-          for (const line of lines) {
-            const l = line.trim();
-            if (!l.startsWith("data:")) continue;
-            const payload = l.slice(5).trim();
-            if (!payload || payload === "[DONE]") continue;
-            let j: any;
-            try { j = JSON.parse(payload); } catch { continue; }
-            if (!started) {
-              started = true;
-              inputTokens = j?.usage?.prompt_tokens ?? 0;
-              controller.enqueue(sse("message_start", {
-                type: "message_start",
-                message: {
-                  id: msgId, type: "message", role: "assistant", model: modelName,
-                  content: [], stop_reason: null, stop_sequence: null,
-                  usage: { input_tokens: inputTokens, output_tokens: 0 },
-                },
-              }));
-              controller.enqueue(sse("ping", { type: "ping" }));
-            }
-            const ch = j?.choices?.[0];
-            const delta = ch?.delta;
-            // GLM/DeepSeek-compatible providers may expose reasoning separately.
-            // Preserve it in the Anthropic text stream instead of dropping it.
-            const textDelta = delta?.content ?? delta?.reasoning_content;
-            if (textDelta) {
-              if (textBlockIdx === null) {
-                textBlockIdx = nextIdx++;
-                controller.enqueue(sse("content_block_start", {
-                  type: "content_block_start", index: textBlockIdx,
-                  content_block: { type: "text", text: "" },
-                }));
-              }
-              controller.enqueue(sse("content_block_delta", {
-                type: "content_block_delta", index: textBlockIdx,
-                delta: { type: "text_delta", text: typeof textDelta === "string" ? textDelta : flattenContent(textDelta) },
-              }));
-            }
-            if (Array.isArray(delta?.tool_calls)) {
-              for (const tc of delta.tool_calls) {
-                const idx = tc.index ?? 0;
-                let block = toolBlocks.get(idx);
-                if (!block) {
-                  const id = tc.id ?? "toolu_" + Math.random().toString(36).slice(2);
-                  const name = tc?.function?.name ?? "tool";
-                  const anthIdx = nextIdx++;
-                  block = { id, name, anthIdx, argBuf: "" };
-                  toolBlocks.set(idx, block);
-                  controller.enqueue(sse("content_block_start", {
-                    type: "content_block_start", index: anthIdx,
-                    content_block: { type: "tool_use", id, name, input: {} },
-                  }));
-                } else if (tc?.function?.name && block.name === "tool") {
-                  block.name = tc.function.name;
-                }
-                const argChunk = tc?.function?.arguments;
-                if (argChunk) {
-                  block.argBuf += argChunk;
-                  controller.enqueue(sse("content_block_delta", {
-                    type: "content_block_delta", index: block.anthIdx,
-                    delta: { type: "input_json_delta", partial_json: argChunk },
-                  }));
-                }
-              }
-            }
-            if (ch?.finish_reason) {
-              stopReason = ch.finish_reason === "length" ? "max_tokens" : ch.finish_reason === "tool_calls" ? "tool_use" : "end_turn";
-            }
-            if (j?.usage?.completion_tokens != null) outputTokens = j.usage.completion_tokens;
-          }
+
+  const ensureHeartbeat = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+    if (heartbeat) return;
+    heartbeat = setInterval(() => {
+      if (!finished) {
+        try { controller.enqueue(sse("ping", { type: "ping" })); } catch {}
+      }
+    }, 15_000);
+  };
+  const stopHeartbeat = () => {
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+  };
+
+  const messageStart = () => sse("message_start", {
+    type: "message_start",
+    message: {
+      id: msgId, type: "message", role: "assistant", model: modelName,
+      content: [], stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: inputTokens, output_tokens: 0 },
+    },
+  });
+
+  // One OpenAI-style SSE `data:` line → zero or more Anthropic events.
+  // Extracted so the trailing buffered line (no trailing newline on a
+  // truncated upstream) can reuse the exact same logic at stream end —
+  // the final usage frame can no longer be silently dropped.
+  const handleLine = (line: string, controller: ReadableStreamDefaultController<Uint8Array>) => {
+    const l = line.trim();
+    if (!l.startsWith("data:")) return;
+    const payload = l.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    let j: any;
+    try { j = JSON.parse(payload); } catch { return; }
+    // Gateway error frame (resilient stream mid-stream death) — remember it so
+    // the stream ends with an honest Anthropic error, not a happy ending.
+    if (j?.error) { upstreamFailed = true; return; }
+    if (!started) {
+      started = true;
+      inputTokens = j?.usage?.prompt_tokens ?? 0;
+      controller.enqueue(messageStart());
+      controller.enqueue(sse("ping", { type: "ping" }));
+    }
+    const ch = j?.choices?.[0];
+    const delta = ch?.delta;
+    // GLM/DeepSeek-compatible providers may expose reasoning separately.
+    // Preserve it in the Anthropic text stream instead of dropping it.
+    const textDelta = delta?.content ?? delta?.reasoning_content;
+    if (textDelta) {
+      if (textBlockIdx === null) {
+        textBlockIdx = nextIdx++;
+        controller.enqueue(sse("content_block_start", {
+          type: "content_block_start", index: textBlockIdx,
+          content_block: { type: "text", text: "" },
+        }));
+      }
+      controller.enqueue(sse("content_block_delta", {
+        type: "content_block_delta", index: textBlockIdx,
+        delta: { type: "text_delta", text: typeof textDelta === "string" ? textDelta : flattenContent(textDelta) },
+      }));
+    }
+    if (Array.isArray(delta?.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index ?? 0;
+        let block = toolBlocks.get(idx);
+        if (!block) {
+          const id = tc.id ?? "toolu_" + Math.random().toString(36).slice(2);
+          const name = tc?.function?.name ?? "tool";
+          const anthIdx = nextIdx++;
+          block = { id, name, anthIdx, argBuf: "" };
+          toolBlocks.set(idx, block);
+          controller.enqueue(sse("content_block_start", {
+            type: "content_block_start", index: anthIdx,
+            content_block: { type: "tool_use", id, name, input: {} },
+          }));
+        } else if (tc?.function?.name && block.name === "tool") {
+          block.name = tc.function.name;
         }
+        const argChunk = tc?.function?.arguments;
+        if (argChunk) {
+          block.argBuf += argChunk;
+          controller.enqueue(sse("content_block_delta", {
+            type: "content_block_delta", index: block.anthIdx,
+            delta: { type: "input_json_delta", partial_json: argChunk },
+          }));
+        }
+      }
+    }
+    if (ch?.finish_reason) {
+      stopReason = ch.finish_reason === "length" ? "max_tokens" : ch.finish_reason === "tool_calls" ? "tool_use" : "end_turn";
+    }
+    if (j?.usage?.completion_tokens != null) outputTokens = j.usage.completion_tokens;
+  };
+
+  // PULL-based: upstream is read only when the client consumes, so a slow
+  // client can no longer balloon worker memory through this translator.
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (finished) return;
+      ensureHeartbeat(controller);
+      let step: any;
+      try {
+        step = await reader.read();
+      } catch {
+        // Upstream death. Emit a valid, honest Anthropic error stream instead
+        // of a synthetic happy ending that hides the truncation.
+        finished = true;
+        stopHeartbeat();
+        try {
+          if (!started) { started = true; controller.enqueue(messageStart()); }
+          if (textBlockIdx !== null) controller.enqueue(sse("content_block_stop", { type: "content_block_stop", index: textBlockIdx }));
+          for (const tb of toolBlocks.values()) controller.enqueue(sse("content_block_stop", { type: "content_block_stop", index: tb.anthIdx }));
+          controller.enqueue(sse("error", { type: "error", error: { type: "api_error", message: "Upstream stream interrupted mid-response. Safe to retry." } }));
+          controller.close();
+        } catch {}
+        return;
+      }
+      const { value, done } = step;
+      if (done) {
+        finished = true;
+        stopHeartbeat();
+        // Flush a trailing buffered line that never got its newline.
+        if (buf.trim()) { const last = buf; buf = ""; handleLine(last, controller); }
         if (textBlockIdx !== null) controller.enqueue(sse("content_block_stop", { type: "content_block_stop", index: textBlockIdx }));
         for (const tb of toolBlocks.values()) controller.enqueue(sse("content_block_stop", { type: "content_block_stop", index: tb.anthIdx }));
+        if (upstreamFailed) {
+          // The gateway reported an upstream interruption — propagate it.
+          controller.enqueue(sse("error", { type: "error", error: { type: "api_error", message: "Upstream stream interrupted. Partial response delivered." } }));
+          controller.close();
+          return;
+        }
         controller.enqueue(sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }));
         controller.enqueue(sse("message_stop", { type: "message_stop" }));
         controller.close();
-      } catch {
-        // A body reset must still end with a valid Anthropic stream. Propagating
-        // a ReadableStream error leaves SDKs with a network exception and no
-        // response object, which is the source of `reading 'response'` crashes.
-        try {
-          if (!started) {
-            started = true;
-            controller.enqueue(sse("message_start", {
-              type: "message_start",
-              message: {
-                id: msgId, type: "message", role: "assistant", model: modelName,
-                content: [], stop_reason: null, stop_sequence: null,
-                usage: { input_tokens: inputTokens, output_tokens: 0 },
-              },
-            }));
-          }
-          if (textBlockIdx !== null) controller.enqueue(sse("content_block_stop", { type: "content_block_stop", index: textBlockIdx }));
-          for (const tb of toolBlocks.values()) controller.enqueue(sse("content_block_stop", { type: "content_block_stop", index: tb.anthIdx }));
-          controller.enqueue(sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } }));
-          controller.enqueue(sse("message_stop", { type: "message_stop" }));
-          controller.close();
-        } catch {}
-      } finally {
-        finished = true;
-        clearInterval(heartbeat);
+        return;
       }
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) handleLine(line, controller);
     },
-    cancel(r) { void reader.cancel(r); },
+    cancel(r) { finished = true; stopHeartbeat(); void reader.cancel(r); },
   });
 }
 
