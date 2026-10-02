@@ -610,6 +610,31 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
       logUsage(supabaseAdmin, { apiKey, provider, model, token: t, cost, inTok: usage.prompt_tokens, outTok: usage.completion_tokens, latency: Date.now() - attemptStart, success: true }),
       t.id !== "__keyless__" ? markUsed(supabaseAdmin, t.id) : Promise.resolve(),
     ]);
+    // If the caller asked for SSE but the upstream ignored `stream:true` and
+    // returned a buffered JSON body, wrap it into a valid SSE sequence so
+    // streaming clients never receive a non-stream payload mid-protocol.
+    if (wantStream) {
+      const cmplId = `chatcmpl-${crypto.randomUUID()}`;
+      const frame = (delta: any, extra: any = {}) =>
+        `data: ${JSON.stringify({
+          id: cmplId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: model.display_name,
+          choices: [{ index: 0, delta, finish_reason: null }],
+          ...extra,
+        })}\n\n`;
+      let content = "";
+      try { content = JSON.parse(text)?.choices?.[0]?.message?.content ?? ""; } catch {}
+      const sseBody =
+        frame({ role: "assistant", content: "" }) +
+        frame({ content }, {
+          usage: { ...usage, total_tokens: usage.prompt_tokens + usage.completion_tokens },
+          choices: [{ index: 0, delta: { content }, finish_reason: "stop" }],
+        }) +
+        "data: [DONE]\n\n";
+      return { kind: "stream", body: new Response(sseBody).body!, startedAt: attemptStart, ctx: { sb: supabaseAdmin, apiKey, provider, model, token: t, attemptStart } };
+    }
     return { kind: "json", text, usage, startedAt: attemptStart };
   }
 
