@@ -87,8 +87,8 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { name: "twitter:site", content: "@Lovable" },
       { name: "twitter:title", content: "Silence API — Enterprise OpenAI-compatible Gateway" },
       { name: "twitter:description", content: "Silence API is a production OpenAI-compatible gateway with encrypted providers, intelligent routing, real analytics and enterprise reliability." },
-      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/25de82ae-bf79-422c-83e9-b432e6068b2b/id-preview-78655d5e--a65cae9c-1ab3-40bf-b0e2-6cf45feec561.lovable.app-1784389998289.png" },
-      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/25de82ae-bf79-422c-83e9-b432e6068b2b/id-preview-78655d5e--a65cae9c-1ab3-40bf-b0e2-6cf45feec561.lovable.app-1784389998289.png" },
+      { property: "og:image", content: "/branding/silence-gateway-logo.png" },
+      { name: "twitter:image", content: "/branding/silence-gateway-logo.png" },
     ],
     links: [
       {

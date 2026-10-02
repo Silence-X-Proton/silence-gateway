@@ -377,8 +377,13 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
     (estInTok / 1_000_000) * inPrice +
     (assumedOut / 1_000_000) * outPrice +
     Number(model.request_cost ?? 0);
-  // Authenticated owners are exempt from the BLOCKING pre-flight check (their
-  // balance may go negative), but bumpUsage still debits and logs real spend.
+  // Authenticated owners are exempt from the BLOCKING pre-flight checks
+  // (their balance may go negative), but bumpUsage still debits and logs real
+  // spend. The zero-balance gate lives here too — user-side blocking limits
+  // must never apply to a DB-verified owner.
+  if (!isOwner && Number(apiKey.balance) <= 0) {
+    return { kind: "error", status: 402, body: { error: { message: "Insufficient balance", type: "billing_error" } } };
+  }
   if (!isOwner && worstCost > Number(apiKey.balance)) {
     return {
       kind: "error",

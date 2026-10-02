@@ -1,4 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
 import { ShieldCheck, Zap, GitBranch, LineChart, Lock, Radio, ArrowRight, Sparkles, Check, Copy, Terminal, Boxes } from "lucide-react";
 import claudeLogo from "@/assets/models/claude.webp";
 import openaiLogo from "@/assets/models/openai.png";
@@ -138,6 +139,11 @@ function GatewayEngine() {
 }
 
 function Landing() {
+  // Auto-detect the hosting origin (Cloudflare URL / custom domain) so the
+  // hero code example always shows the live gateway URL — never a stale
+  // hardcoded Lovable domain.
+  const [origin, setOrigin] = useState("");
+  useEffect(() => { setOrigin(window.location.origin); }, []);
   return (
     <div className="relative min-h-screen overflow-hidden">
       <div aria-hidden className="pointer-events-none absolute inset-x-0 top-0 h-[560px] hero-grid" />
@@ -215,7 +221,7 @@ function Landing() {
               <pre className="overflow-x-auto p-5 font-mono text-[12.5px] leading-6 text-slate-200">
 <span className="text-slate-500">from</span> <span className="text-sky-300">openai</span> <span className="text-slate-500">import</span> OpenAI{"\n\n"}
 client = OpenAI({"\n"}
-{"    "}base_url=<span className="text-emerald-300">&quot;https://silence-api.lovable.app/v1&quot;</span>,{"\n"}
+{"    "}base_url=<span className="text-emerald-300">&quot;{origin}/v1&quot;</span>,{"\n"}
 {"    "}api_key=<span className="text-emerald-300">&quot;sk-silence-xxxxxxxx&quot;</span>{"\n"}
 ){"\n\n"}
 resp = client.chat.completions.create({"\n"}

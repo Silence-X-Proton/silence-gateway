@@ -144,7 +144,7 @@ export function anthToOpenAI(body: any) {
       "# Tool Use Protocol",
       "You have access to the following tools. To invoke a tool, output ONE OR MORE tool call blocks EXACTLY in this format:",
       "<tool_call>",
-      `{"name":"<tool_name>","arguments":{ ...json args... }}`,
+      `<tool_call>{"name":"<tool_name>","arguments":{ ...json args... }}</tool_call>`,
       "</tool_call>",
       "Rules:",
       "- Use ONLY tools listed below. Arguments MUST be valid JSON matching the input schema.",
@@ -587,8 +587,14 @@ export function translatePromptedStream(upstream: ReadableStream<Uint8Array>, mo
       try {
         for (;;) {
           const { value, done } = await reader.read();
-          if (done) break;
-          sseBuf += dec.decode(value, { stream: true });
+          if (done) {
+            // Flush the decoder and append a newline so a final SSE line that
+            // lacked its trailing newline is parsed, not silently dropped.
+            try { sseBuf += dec.decode(); } catch {}
+            sseBuf += "\n";
+          } else {
+            sseBuf += dec.decode(value, { stream: true });
+          }
           const lines = sseBuf.split("\n");
           sseBuf = lines.pop() ?? "";
           for (const line of lines) {
@@ -622,6 +628,7 @@ export function translatePromptedStream(upstream: ReadableStream<Uint8Array>, mo
             if (ch?.finish_reason === "length") stopReason = "max_tokens";
             drain(false);
           }
+          if (done) break;
         }
         drain(true);
         for (const call of nativeToolCalls.values()) {
@@ -632,6 +639,9 @@ export function translatePromptedStream(upstream: ReadableStream<Uint8Array>, mo
           emitToolUse(JSON.stringify({ id: call.id, name: call.name, arguments: args }));
         }
       } catch {
+        // Upstream died mid-stream — tell the SDK so it can retry instead of
+        // treating truncated text as a complete response.
+        send("error", { type: "error", error: { type: "api_error", message: "Upstream stream interrupted. Partial response delivered." } });
         drain(true);
       } finally {
         clearInterval(heartbeat);
@@ -661,8 +671,14 @@ export async function collectOpenAIStream(stream: ReadableStream<Uint8Array>) {
   const toolCalls: any[] = [];
   for (;;) {
     const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
+    if (done) {
+      // Flush the decoder and parse a final SSE line that lacked a newline
+      // so the last usage/content frame is never dropped.
+      try { buf += dec.decode(); } catch {}
+      buf += "\n";
+    } else {
+      buf += dec.decode(value, { stream: true });
+    }
     const lines = buf.split("\n");
     buf = lines.pop() ?? "";
     for (const line of lines) {
@@ -688,6 +704,7 @@ export async function collectOpenAIStream(stream: ReadableStream<Uint8Array>) {
       }
       if (ch?.finish_reason) finish = ch.finish_reason;
     }
+    if (done) break;
   }
   return {
     id: "chatcmpl_" + Math.random().toString(36).slice(2),

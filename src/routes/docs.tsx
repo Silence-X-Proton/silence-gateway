@@ -14,11 +14,6 @@ import {
   Link2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import anthropicLogo from "@/assets/logos/anthropic.svg.asset.json";
-import linuxLogo from "@/assets/logos/linux.svg.asset.json";
-import ubuntuLogo from "@/assets/logos/ubuntu.svg.asset.json";
-import appleLogo from "@/assets/logos/apple.svg.asset.json";
-import windowsLogo from "@/assets/logos/windows.svg.asset.json";
 import { BrandLogo } from "@/components/silence/BrandLogo";
 
 export const Route = createFileRoute("/docs")({
@@ -43,14 +38,19 @@ export const Route = createFileRoute("/docs")({
   component: DocsPage,
 });
 
-const BASE_URL = "https://silence-api.lovable.app/api/public";
+/* Base URL is AUTO-DETECTED from whatever origin hosts this app — Cloudflare
+   workers.dev, a custom domain, or a Lovable preview all just work. SSR and
+   the first client render share the same relative fallback so hydration is
+   stable; the real origin is filled in right after mount. */
+const BASE_PATH = "/api/public";
 
-/* Brand-accurate SVGs loaded from the Lovable CDN */
-const ANTHROPIC_URL = anthropicLogo.url;
-const LINUX_URL = linuxLogo.url;
-const UBUNTU_URL = ubuntuLogo.url;
-const APPLE_URL = appleLogo.url;
-const WINDOWS_URL = windowsLogo.url;
+/* Brand-accurate SVGs — served LOCALLY from /public/logos so they can never
+   break (the old Lovable CDN /__l5e/assets-v1 URLs 404 outside Lovable). */
+const ANTHROPIC_URL = "/logos/anthropic.svg";
+const LINUX_URL = "/logos/linux.svg";
+const UBUNTU_URL = "/logos/ubuntu.svg";
+const APPLE_URL = "/logos/apple.svg";
+const WINDOWS_URL = "/logos/windows.svg";
 
 /* Simple inline Kimi glyph — subtle, on-brand, no external asset */
 function KimiLogo({ className }: { className?: string }) {
@@ -134,6 +134,11 @@ function DocsPage() {
   const [activeSection, setActiveSection] = useState("quickstart");
   const [openStep, setOpenStep] = useState<number | null>(1);
   const [openKimiStep, setOpenKimiStep] = useState<number | null>(1);
+  // Auto-detect the hosting origin (Cloudflare URL / custom domain) at runtime
+  // so every example below always points at the live gateway.
+  const [origin, setOrigin] = useState("");
+  useEffect(() => { setOrigin(window.location.origin); }, []);
+  const BASE_URL = `${origin}${BASE_PATH}`;
 
   useEffect(() => {
     const ids = [
