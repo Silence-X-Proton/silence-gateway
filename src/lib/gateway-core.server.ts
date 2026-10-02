@@ -192,7 +192,6 @@ export async function runGateway(request: Request, openaiBody: any): Promise<Gat
     if (clientIp) { try { await supabaseAdmin.rpc("gw_record_ip_strike", { _ip: clientIp, _reason: "invalid_key" }); } catch {} }
     return { kind: "error", status: 401, body: { error: { message: "Invalid API key", type: "auth_error" } } };
   }
-  if (Number(apiKey.balance) <= 0) return { kind: "error", status: 402, body: { error: { message: "Insufficient balance", type: "billing_error" } } };
 
   const modelName = String(openaiBody.model ?? "").trim();
   if (!modelName) return { kind: "error", status: 400, body: { error: { message: "model is required" } } };

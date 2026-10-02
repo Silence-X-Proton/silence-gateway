@@ -242,7 +242,7 @@ function safeParse(s: any) { try { return JSON.parse(s); } catch { return s ?? {
 // Returns cleaned text (blocks removed) and parsed tool_use blocks.
 export function extractPromptedToolCalls(text: string): { cleanText: string; toolUses: Array<{ id: string; name: string; input: any }> } {
   const toolUses: Array<{ id: string; name: string; input: any }> = [];
-  const re = /\s*<tool_call>([\s\S]*?)\s*<\/tool_call>/g;
+  const re = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
   let cleanText = text.replace(re, (_m, inner) => {
     let obj: any = null;
     try { obj = JSON.parse(inner); } catch {
